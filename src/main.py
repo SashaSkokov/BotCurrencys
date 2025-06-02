@@ -1,33 +1,36 @@
-import logging
-from aiogram import Bot, Dispatcher, types
-from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, BotCommand, FSInputFile
-from aiogram.filters import Command
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
 import asyncio
-import requests
-from datetime import datetime
-import asyncpg
+import logging
 import os
-import pandas as pd
-from rate_limiter import RateLimiter
+from datetime import datetime
 from html import escape
-import json
+import pandas as pd
+import requests
+from aiogram import Bot, Dispatcher, types
+from aiogram.filters import Command
+from aiogram.types import FSInputFile
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+
+from Database import create_pool, get_connection, config
+from keyboards import commands, all_commands_keyboard, keyboard
+from rate_limiter import RateLimiter
+from src.keyboards import keyboardSubscribe
+
 
 def sanitize_message(text):
     return escape(text)
 
-with open('../config.json', 'r') as config_file:
-    config = json.load(config_file)
 
-API_TOKEN = config['telegram']['bot_token']
-API_KEY = config['api']['key']
-ADMIN_CHAT_ID = config['admin']['id']
+API_TOKEN = config.get('bot').get('token')
+API_KEY = config.get('api').get('key')
+ADMIN_CHAT_ID = config.get('admin').get('chat_id')
 
 
 bot = Bot(token=API_TOKEN)
 dp = Dispatcher()
 pool = None
-
+STATE_SUBSCRIBE = None
+STATE_ACTIVESUBSCRIBERS = None
+STATE_EXPORT = None
 
 logging.basicConfig(
     level=logging.INFO,
@@ -36,33 +39,11 @@ logging.basicConfig(
 
 rate_limiter = RateLimiter(limit=100, period=300)
 
-keyboard = ReplyKeyboardMarkup(
-    keyboard=[[KeyboardButton(text="Поделиться контактом", request_contact=True)]],
-    resize_keyboard=True
-)
+
 
 EXPORT_DIR = 'exports'
 if not os.path.exists(EXPORT_DIR):
     os.makedirs(EXPORT_DIR)
-
-
-async def createTables():
-    async with pool.acquire() as connection:
-        await connection.execute('''CREATE TABLE IF NOT EXISTS contacts(
-                                id SERIAL PRIMARY KEY, 
-                                user_id BIGINT UNIQUE, 
-                                username TEXT COLLATE "ru_RU.utf8", 
-                                phone_number TEXT UNIQUE)
-                                 ''')
-
-        await connection.execute('''CREATE TABLE IF NOT EXISTS subscriptions(
-                                    id SERIAL PRIMARY KEY, 
-                                    user_id BIGINT UNIQUE,
-                                    username TEXT COLLATE "ru_RU.utf8",
-                                    currencies TEXT[],
-                                    is_active BOOLEAN DEFAULT TRUE,
-                                    subscribe_date TIMESTAMP DEFAULT NOW())
-                                 ''')
 
 
 ValueCurrencies = {'USD', 'EUR'}
@@ -98,56 +79,8 @@ async def start(message: types.Message):
     )
 
 
-@dp.message(Command("export"))
-async def export_subscriptions(message: types.Message):
-    can_process, remaining_time = rate_limiter.can_process(message.from_user.id)
-
-    if not can_process:
-        await message.answer(f"Превышен лимит запросов!\n"
-                             f"Попробуйте снова через {remaining_time}")
-        return
-    if str(message.from_user.id) == str(ADMIN_CHAT_ID):
-        while True:
-            try:
-                command_parts = message.text.split()
-
-                if len(command_parts) < 2:
-                    raise ValueError("Не указана валюта")
-
-                currency = validate_currency(message.text.split()[1].upper())
-
-                filename = await export_subscriptions_to_excel(currency)
-                if filename is None:
-                    await message.answer(f"Нет подписок по валюте {currency}")
-                    return
-                if os.path.exists(filename):
-                    document = FSInputFile(filename)
-                    await bot.send_document(
-                        chat_id=message.chat.id,
-                        document=document,
-                        caption=f"Экспорт подписок по валюте {currency}"
-                    )
-                    await secure_delete(filename)
-                else:
-                    await message.answer("Ошибка при создании файла экспорта")
-
-                break
-
-            except ValueError as ve:
-                await message.answer("Пожалуйста, введите команду в формате: /export USD")
-                return
-
-            except Exception as e:
-                logging.error(f"Ошибка при экспорте: {e}")
-                await message.answer("Произошла ошибка при экспорте")
-                return
-
-    else:
-        await message.answer("У вас нет доступа к этой команде")
-
-
 async def export_subscriptions_to_excel(currency=None):
-    async with pool.acquire() as connection:
+    async with get_connection() as connection:
         query = '''SELECT s.username, \
                        s.user_id, \
                        s.currencies, \
@@ -241,18 +174,31 @@ async def help(message: types.Message):
         await message.answer(f"Превышен лимит запросов!\n"
                              f"Попробуйте снова через {remaining_time}")
         return
-    help_text = """
-    Доступные команды:
-    /start - Начало
-    /admin - Авторизация
-    /usd - Курс доллара
-    /eur - Курс евро
-    /help - Помощь
-    /subscribe - подписаться на рассылку
-    /unsubscribe - отписаться от рассылки
-    /export - Экспорт данных (для администратора)
-    /activeSubscribers - Посмотреть активных подписчиков (для администратора)
-    """
+    if int(message.from_user.id)==int(ADMIN_CHAT_ID):
+        help_text = """
+Доступные команды:
+/start - Начало
+/usd - Курс доллара
+/eur - Курс евро
+/help - Помощь
+/mysettings — показать текущие подписки
+/subscribe - подписаться на рассылку
+/unsubscribe - отписаться от рассылки
+/admin - Авторизация
+/export - Экспорт данных
+/activeSubscribers - Посмотреть активных подписчиков
+"""
+    else:
+        help_text = """
+Доступные команды:
+/start - Начало
+/usd - Курс доллара
+/eur - Курс евро
+/help - Помощь
+/mysettings — показать текущие подписки
+/subscribe - подписаться на рассылку
+/unsubscribe - отписаться от рассылки
+"""
     sanitized_help_text = sanitize_message(help_text)
     await message.answer(sanitized_help_text)
 
@@ -314,12 +260,14 @@ async def handleContact(message: types.Message):
         phone_number = message.contact.phone_number
         user_id = message.from_user.id
 
-        async with pool.acquire() as connection:
+        async with get_connection() as connection:
             try:
 
-                record = await connection.fetchrow('SELECT SUBSTRING(phone_number, 2) as phone_number FROM contacts WHERE phone_number = $1', phone_number.replace('+', ''))
+                record = await connection.fetchrow('SELECT SUBSTRING(phone_number, 2) as phone_number FROM contacts WHERE phone_number = $1', phone_number)
+
                 if record:
-                    await message.answer("Вы уже зарегистрированы в системе", reply_markup=types.ReplyKeyboardRemove())
+
+                    await message.answer("Вы уже зарегистрированы в системе", reply_markup=all_commands_keyboard)
                     await bot.send_message(chat_id=ADMIN_CHAT_ID,
                                            text=f"Попытка повторной регистрации:\n"
                                                 f"Номер: {phone_number}\n"
@@ -329,7 +277,7 @@ async def handleContact(message: types.Message):
 
                     await message.answer(f'Спасибо за регистрацию!\n'
                         f'Ваш username: {username}\n'
-                        f'Ваш номер: {phone_number}', reply_markup=types.ReplyKeyboardRemove())
+                        f'Ваш номер: {phone_number}', reply_markup=all_commands_keyboard)
             except Exception as e:
                 logging.error(f"Ошибка при работе с БД: {e}")
                 await message.answer("Произошла ошибка при сохранении данных")
@@ -337,59 +285,59 @@ async def handleContact(message: types.Message):
         await message.answer('Ошибка при получении контакта')
 
 @dp.message(Command("subscribe"))
-async def subscribe(message: types.Message):
-    can_process, remaining_time = rate_limiter.can_process(message.from_user.id)
-
-    if not can_process:
-        await message.answer(f"Превышен лимит запросов!\n"
-                             f"Попробуйте снова через {remaining_time}")
-        return
-    if message.from_user.id != ADMIN_CHAT_ID:
-        keyboardCurrency = ReplyKeyboardMarkup(
-            keyboard=[
-                [KeyboardButton(text="USD")],
-                [KeyboardButton(text="EUR")],
-                [KeyboardButton(text="Все команды")]], resize_keyboard=True)
-        await message.answer("Выберите валюту для подписки:", reply_markup=keyboardCurrency)
-    else:
-        await message.answer("У вас нет доступа к этой команде")
-
-
 @dp.message(Command("unsubscribe"))
-async def subscribe(message: types.Message):
+@dp.message(Command("activeSubscribers"))
+@dp.message(Command("export"))
+async def handle_subscriptions(message: types.Message):
     can_process, remaining_time = rate_limiter.can_process(message.from_user.id)
+    global STATE_SUBSCRIBE
+    global STATE_ACTIVESUBSCRIBERS
+    global STATE_EXPORT
 
     if not can_process:
         await message.answer(f"Превышен лимит запросов!\n"
                              f"Попробуйте снова через {remaining_time}")
         return
-    if message.from_user.id != ADMIN_CHAT_ID:
-        user_id = message.from_user.id
-        async with pool.acquire() as connection:
-            try:
-                await connection.execute("UPDATE subscriptions SET is_active = FALSE, currencies = '{}' WHERE user_id = $1", user_id)
-                await message.answer("Вы успешно отписались от рассылки")
-            except Exception as e:
-                logging.error(f"Ошибка при отписке: {e}")
-                await message.answer("Произошла ошибка при отписке")
-    else:
-        await message.answer("У вас нет доступа к этой команде")
+
+    if message.text == "/subscribe":
+        STATE_SUBSCRIBE = True
+        STATE_ACTIVESUBSCRIBERS = False
+        STATE_EXPORT = False
+        await message.answer("Выберите валюту для подписки:", reply_markup=keyboardSubscribe)
+    elif message.text == "/unsubscribe":
+        STATE_SUBSCRIBE = False
+        STATE_ACTIVESUBSCRIBERS = False
+        STATE_EXPORT = False
+        await message.answer("Выберите валюту для отписки:", reply_markup=keyboardSubscribe)
+    elif message.text == "/activeSubscribers":
+        STATE_SUBSCRIBE = None
+        STATE_ACTIVESUBSCRIBERS = True
+        STATE_EXPORT = False
+        await message.answer("Выберите валюту для проверки подписчиков:", reply_markup=keyboardSubscribe)
+    elif message.text == "/export":
+        STATE_SUBSCRIBE = None
+        STATE_ACTIVESUBSCRIBERS = False
+        STATE_EXPORT = True
+        await message.answer("Выберите валюту для экспорта:", reply_markup=keyboardSubscribe)
 
 
 @dp.message(lambda message: message.text in ["USD", "EUR"])
 async def handleSubscription(message: types.Message):
     can_process, remaining_time = rate_limiter.can_process(message.from_user.id)
-
+    global STATE_SUBSCRIBE
+    global STATE_ACTIVESUBSCRIBERS
+    global STATE_EXPORT
     if not can_process:
         await message.answer(f"Превышен лимит запросов!\n"
                              f"Попробуйте снова через {remaining_time}")
         return
-    if message.from_user.id != ADMIN_CHAT_ID:
+
+    if STATE_SUBSCRIBE:
         user_id = message.from_user.id
         currency = message.text
         username = message.from_user.username or message.from_user.first_name
         date_now = datetime.strptime(datetime.now().strftime('%Y-%m-%d %H:%M'), '%Y-%m-%d %H:%M')
-        async with pool.acquire() as connection:
+        async with get_connection() as connection:
             try:
                 subscription = await connection.fetchval('SELECT user_id FROM subscriptions WHERE user_id = $1',user_id)
 
@@ -404,15 +352,118 @@ async def handleSubscription(message: types.Message):
                         await message.answer(f"Вы уже подписаны на рассылку курса {currency}")
                 else:
 
-                    logging.error(user_id)
                     await connection.execute(
                         'INSERT INTO subscriptions (user_id, currencies, username, subscribe_date) VALUES ($1, ARRAY[$2], $3, $4)', user_id, currency, username, date_now)
                     await message.answer(f"Поздравляем🚀 \nВы подписались на рассылку курса {currency}")
             except Exception as e:
                 logging.error(f"Ошибка при подписке: {e}")
                 await message.answer("Произошла ошибка при подписке")
-    else:
-        await message.answer("У вас нет доступа к этой команде")
+    elif STATE_SUBSCRIBE is False:
+        user_id = message.from_user.id
+        async with get_connection() as connection:
+            try:
+                currency = message.text
+                result = await connection.fetchval(
+                    "SELECT $1 = ANY(currencies) FROM subscriptions WHERE user_id = $2",
+                    currency, user_id
+                )
+                if result:
+                    await connection.execute(
+                        "UPDATE subscriptions SET currencies = array_remove(currencies, $1) WHERE user_id = $2",
+                        currency, user_id)
+
+                    result = await connection.fetchval(
+                        "SELECT currencies IS NOT NULL AND currencies != '{}' FROM subscriptions WHERE user_id = $1",
+                        user_id)
+                    if result:
+                        await message.answer("Вы успешно отписались от рассылки")
+
+                    else:
+                        await connection.execute(
+                            "UPDATE subscriptions SET is_active = FALSE WHERE user_id = $1",
+                            user_id)
+
+                        await message.answer("Вы успешно отписались от рассылки")
+                else:
+                    await message.answer("Вы не подписаны на данную рассылку")
+            except Exception as e:
+                logging.error(f"Ошибка при отписке: {e}")
+                await message.answer("Произошла ошибка при отписке")
+
+    if STATE_ACTIVESUBSCRIBERS:
+        if int(message.from_user.id) == int(ADMIN_CHAT_ID):
+            try:
+
+                currency = message.text
+
+                if not currency:
+                    raise ValueError("Некорректный код валюты")
+
+                async with get_connection() as connection:
+                    rows = await connection.fetch('''SELECT s.username, s.user_id, s.currencies, s.is_active
+                                                     FROM subscriptions s
+                                                     WHERE $1 = ANY (s.currencies)
+                                                  ''', currency)
+
+                    if not rows:
+                        await message.answer(f"Нет пользователей с подпиской на валюту {currency}")
+                        return
+
+                    response = f"Пользователи с подпиской на {currency}:\n\n"
+
+                    for row in rows:
+                        response += f"ID: {row['user_id']}\n"
+                        response += f"Имя: {row['username']}\n"
+                        response += f"Все подписки: {', '.join(row['currencies'])}\n"
+                        response += f"Статус: {'Активна' if row['is_active'] else 'Неактивна'}\n\n"
+
+
+                    await message.answer(response)
+
+
+            except ValueError as ve:
+                await message.answer(f"Ошибка: {ve}")
+            except Exception as e:
+                logging.error(f"Ошибка при получении подписок: {e}")
+                await message.answer("Произошла ошибка при получении данных")
+        else:
+            await message.answer("У вас нет прав для использования этой команды")
+
+    if STATE_EXPORT:
+        if int(message.from_user.id) == int(ADMIN_CHAT_ID):
+            while True:
+                try:
+                    currency = message.text
+
+                    filename = await export_subscriptions_to_excel(currency)
+                    if filename is None:
+                        await message.answer(f"Нет подписок по валюте {currency}")
+                        return
+                    if os.path.exists(filename):
+                        document = FSInputFile(filename)
+                        await bot.send_document(
+                            chat_id=message.chat.id,
+                            document=document,
+                            caption=f"Экспорт подписок по валюте {currency}"
+                        )
+                        await secure_delete(filename)
+                    else:
+                        await message.answer("Ошибка при создании файла экспорта")
+
+                    break
+
+                except ValueError as ve:
+                    await message.answer("Пожалуйста, введите команду в формате: /export USD")
+                    return
+
+                except Exception as e:
+                    logging.error(f"Ошибка при экспорте: {e}")
+                    await message.answer("Произошла ошибка при экспорте")
+                    return
+
+        else:
+            await message.answer("У вас нет доступа к этой команде")
+
 
 
 @dp.message(lambda message: message.text in ["Все команды"])
@@ -438,7 +489,7 @@ async def is_bot_blocked(user_id):
 
 
 async def sendSubscriptions():
-    async with pool.acquire() as connection:
+    async with get_connection() as connection:
         try:
             subscriptions = await connection.fetch('SELECT user_id, currencies FROM subscriptions WHERE is_active = TRUE')
 
@@ -463,7 +514,7 @@ async def sendSubscriptions():
 
 
 scheduler = AsyncIOScheduler()
-scheduler.add_job(sendSubscriptions, 'cron', hour=10, minute=0, timezone='Europe/Moscow')
+scheduler.add_job(sendSubscriptions, 'cron', hour=10, minute=00, timezone='Europe/Moscow')
 
 
 @dp.message(Command("mysettings"))
@@ -474,13 +525,13 @@ async def checkSubscription(message: types.Message):
         await message.answer(f"Превышен лимит запросов!\n"
                              f"Попробуйте снова через {remaining_time}")
         return
-    if int(message.from_user.id) != int(ADMIN_CHAT_ID):
 
-        user_id = message.from_user.id
+    user_id = message.from_user.id
 
-        async with pool.acquire() as connection:
-            subscriptionIsNull = await connection.fetchrow("SELECT is_active FROM subscriptions WHERE user_id = $1", user_id)
+    async with get_connection() as connection:
+        subscriptionIsNull = await connection.fetchrow("SELECT is_active FROM subscriptions WHERE user_id = $1", user_id)
 
+        if subscriptionIsNull is not None:
             if subscriptionIsNull['is_active']:
                 subscription = await connection.fetchrow('SELECT * FROM subscriptions WHERE user_id = $1', user_id)
                 currencies = subscription['currencies']
@@ -494,89 +545,28 @@ async def checkSubscription(message: types.Message):
                 await message.answer(response)
             else:
                 await message.answer("У вас нет активной подписки")
-
-
-    else:
-        await message.answer("Вы являетесь администратором")
-
-
-@dp.message(Command("activeSubscribers"))
-async def SubscriptionsByCurrency(message: types.Message):
-    can_process, remaining_time = rate_limiter.can_process(message.from_user.id)
-
-    if not can_process:
-        await message.answer(f"Превышен лимит запросов!\n"
-                             f"Попробуйте снова через {remaining_time}")
-        return
-    if str(message.from_user.id) == ADMIN_CHAT_ID:
-        try:
-
-            currency = message.text.split()[1].upper()
-
-            if not currency:
-                raise ValueError("Некорректный код валюты")
-
-            async with pool.acquire() as connection:
-                rows = await connection.fetch('''SELECT s.username, s.user_id, s.currencies, s.is_active
-                                              FROM subscriptions s
-                                              WHERE $1 = ANY (s.currencies)
-                                              ''', currency)
-
-                if not rows:
-                    await message.answer(f"Нет пользователей с подпиской на валюту {currency}")
-                    return
-
-                response = f"Пользователи с подпиской на {currency}:\n\n"
-
-                for row in rows:
-                    response += f"ID: {row['user_id']}\n"
-                    response += f"Имя: {row['username']}\n"
-                    response += f"Все подписки: {', '.join(row['currencies'])}\n"
-                    response += f"Статус: {'Активна' if row['is_active'] else 'Неактивна'}\n\n"
-
-                await message.answer(response)
-
-        except IndexError:
-            await message.answer("Укажите валюту после команды, например: /activeSubscribers USD")
-        except ValueError as ve:
-            await message.answer(f"Ошибка: {ve}")
-        except Exception as e:
-            logging.error(f"Ошибка при получении подписок: {e}")
-            await message.answer("Произошла ошибка при получении данных")
-    else:
-        await message.answer("У вас нет прав для использования этой команды")
-
-
-async def createPool():
-    global pool
-    pool = await asyncpg.create_pool(
-        database=config['database']['name'],
-        user=config['database']['user'],
-        password=config['database']['password'],
-        host=config['database']['host'],
-        max_size=10,
-        min_size=1
-    )
-    await createTables()
-
+        else:
+            await message.answer("У вас нет активной подписки")
 
 async def main():
-    await bot.set_my_commands(
-        [BotCommand(command='start', description='Начало'),
-         BotCommand(command='usd', description='Курс доллара'),
-         BotCommand(command='eur', description='Курс евро'),
-         BotCommand(command='subscribe', description="Подписаться на ежедневную рассылку курса"),
-         BotCommand(command='unsubscribe', description="Отписаться от рассылки"),
-         BotCommand(command='mysettings', description="Показать текущие подписки"),
-         BotCommand(command='help', description="Помощь")]
+    global STATE_SUBSCRIBE
+    global STATE_ACTIVESUBSCRIBERS
+    global STATE_EXPORT
 
-    )
+    await bot.set_my_commands(commands)
     try:
-        await createPool()
+        await create_pool()
         scheduler.start()
-        await dp.start_polling(bot)
-    except KeyboardInterrupt:
-        logging.info("Бот остановлен пользователем")
+
+        try:
+            await dp.start_polling(bot, skip_updates=True)
+        except asyncio.CancelledError:
+            logging.warning("Бот остановлен пользователем")
+        except KeyboardInterrupt:
+            logging.info("Бот остановлен пользователем")
+        except Exception as e:
+            logging.error(f"Ошибка при запуске polling: {e}")
+
     finally:
         if pool:
             await pool.close()
