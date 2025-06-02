@@ -15,4 +15,4 @@ ENV ADMIN_CHAT_ID=your_admin_id
 
 EXPOSE 8000
 
-CMD ["python", "bot new.py"]
+CMD ["python", "main.py"]
