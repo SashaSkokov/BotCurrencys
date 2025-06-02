@@ -1,0 +1,10 @@
+# PyCharm
+.idea/
+*.iml
+
+# Python
+__pycache__/
+*.pyc
+
+# Config files
+config.json
