@@ -327,15 +327,21 @@ async def handleSubscription(message: types.Message):
     global STATE_SUBSCRIBE
     global STATE_ACTIVESUBSCRIBERS
     global STATE_EXPORT
+    user_id = message.from_user.id
+    currency = message.text
+    username = message.from_user.username or message.from_user.first_name
+    adminIsContact = ""
+
     if not can_process:
         await message.answer(f"Превышен лимит запросов!\n"
                              f"Попробуйте снова через {remaining_time}")
         return
 
+    async with get_connection() as connection:
+        adminIsContact = await connection.fetchval('SELECT user_id FROM contacts WHERE user_id = $1', user_id)
+
     if STATE_SUBSCRIBE:
-        user_id = message.from_user.id
-        currency = message.text
-        username = message.from_user.username or message.from_user.first_name
+
         date_now = datetime.strptime(datetime.now().strftime('%Y-%m-%d %H:%M'), '%Y-%m-%d %H:%M')
         async with get_connection() as connection:
             try:
@@ -359,7 +365,7 @@ async def handleSubscription(message: types.Message):
                 logging.error(f"Ошибка при подписке: {e}")
                 await message.answer("Произошла ошибка при подписке")
     elif STATE_SUBSCRIBE is False:
-        user_id = message.from_user.id
+
         async with get_connection() as connection:
             try:
                 currency = message.text
@@ -392,10 +398,11 @@ async def handleSubscription(message: types.Message):
 
     if STATE_ACTIVESUBSCRIBERS:
         if int(message.from_user.id) == int(ADMIN_CHAT_ID):
+            if adminIsContact is None:
+                await message.answer("Зарегистрируйтесь, прежде чем воспользоваться командой")
+                return
             try:
-
                 currency = message.text
-
                 if not currency:
                     raise ValueError("Некорректный код валюты")
 
@@ -431,6 +438,9 @@ async def handleSubscription(message: types.Message):
 
     if STATE_EXPORT:
         if int(message.from_user.id) == int(ADMIN_CHAT_ID):
+            if adminIsContact is None:
+                await message.answer("Зарегистрируйтесь, прежде чем воспользоваться командой")
+                return
             while True:
                 try:
                     currency = message.text
