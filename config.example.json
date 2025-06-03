@@ -1,0 +1,17 @@
+{
+  "bot": {
+    "token": "YOUR_BOT_TOKEN"
+  },
+  "api": {
+    "key": "YOUR_API_TOKEN"
+  },
+  "admin": {
+    "chat_id": "YOUR_ADMIN_ID"
+  },
+  "database": {
+    "name": "YOUR_DATABASE",
+    "user": "YOUR_NAME",
+    "password": "YOUR_PASSWORD",
+    "host": "YOUR_HOST"
+  }
+}
