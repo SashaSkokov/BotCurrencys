@@ -18,7 +18,7 @@
 - pip install -r requirements.txt
 3. Настройте config.json
 4. Запустите бота:
-- python bot new.py
+- python bot main.py
 ## Развертывание через Docker
 1. Установите Docker и Docker Compose
 2. Скопируйте пример конфигурации:
